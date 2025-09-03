@@ -111,7 +111,7 @@ The script generates several output files organized in the specified output dire
 
 - **`*_modes.npy`**: NumPy array containing mode vectors
 
-- **`*_mode_*.txt`**: Text files containing mode vectors for individual modes
+- **`*_mode_*.xyz`**: Individual modes vectors written in [XYZ format](https://www.cgl.ucsf.edu/chimera/current/docs/UsersGuide/xyz.html)
 
 ### 3. Trajectory Files
 - **`*_mode_*_traj.pdb`**: PDB trajectories visualizing mode motions
