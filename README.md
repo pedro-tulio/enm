@@ -212,9 +212,9 @@ python enm.py -i protein.pdb -o results --no_gpu
 
 - `Numba >= 0.55`
 
-- `CuPy >= 8.0` (optional, for GPU acceleration. **Note:** cupy requires matching CUDA toolkit.)
-
 - `Matplotlib >= 3.5`
+
+- `CuPy >= 8.0` (optional, for GPU acceleration. **Note:** cupy requires matching CUDA toolkit.)
 
 [Back to top ↩](#)
 * ****
