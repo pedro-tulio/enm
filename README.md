@@ -1,4 +1,6 @@
 # Elastic Network Model Analysis
+[![DOI](https://zenodo.org/badge/1042955611.svg)](https://doi.org/10.5281/zenodo.17898498)
+
 
 This program performs Elastic Network Model analysis to study protein dynamics by simplifying structures into spring networks. It calculates normal modes to identify collective motions, supports both Cα and heavy-atom models, and generates various analyses including fluctuations, correlations, and mode visualizations.
 
@@ -29,6 +31,7 @@ The implementation features GPU acceleration and parallel processing for efficie
     - [Minimal analysis (only essential outputs):](#minimal-analysis-only-essential-outputs)
     - [Force CPU-only computation:](#force-cpu-only-computation)
   - [Dependencies](#dependencies)
+  - [Citing](#citing)
   - [Contact](#contact)
   - [License](#license)
 
@@ -218,6 +221,14 @@ python enm.py -i protein.pdb -o results --no_gpu
 
 [Back to top ↩](#)
 * ****
+
+## Citing
+
+Please cite the following paper if you are using ENM in your work:
+
+[Pedro Túlio de Resende-Lara. (2025). pedro-tulio/enm: Elastic Network Model (v1.0.0). Zenodo. DOI: 10.5281/zenodo.17898499](https://zenodo.org/records/17898499)
+
+[Back to top ↩](#)
 
 ## Contact
 
