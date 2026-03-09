@@ -3,20 +3,20 @@ import openmm as mm
 from openmm import app, unit, Platform
 from scipy.linalg import eigh
 from scipy.spatial.distance import pdist, squareform
-from scipy.sparse import diags, identity
-import numba
-from numba import njit, prange, float64, int32
+from scipy.sparse import coo_matrix
 import matplotlib.pyplot as plt
 from matplotlib import colors
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
-import cupy as cp
 import argparse
 import sys
 import os
 import time
 import csv
 import logging
+import cupy as cp
+from cupyx.scipy.sparse import coo_matrix as coo_gpu
+
 
 class AnsiColorFormatter(logging.Formatter):
     COLORS = {
@@ -29,6 +29,20 @@ class AnsiColorFormatter(logging.Formatter):
     RESET_COLOR = '\033[0m'
 
     def format(self, record):
+        """
+        Format a log record, wrapping the message in ANSI colour codes for
+        its severity level and resetting colour at the end.
+
+        Parameters
+        ----------
+        record : logging.LogRecord
+            The log record to format.
+
+        Returns
+        -------
+        str
+            Colour-coded, formatted log message string.
+        """
         log_message = super().format(record)
         color = self.COLORS.get(record.levelname, self.RESET_COLOR)
         return f"{color}{log_message}{self.RESET_COLOR}"
@@ -50,7 +64,61 @@ file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
 
 def parse_arguments():
-    """Parse command-line arguments for the ENM analysis."""
+    """
+    Parse command-line arguments for the ENM normal mode analysis pipeline.
+
+    Reads sys.argv and populates an argument namespace with all options
+    required to configure the ENM system, diagonalisation, and output
+    generation.  Default values are applied where arguments are omitted.
+
+    Returns
+    -------
+    args : argparse.Namespace
+        Parsed argument namespace with the following attributes:
+
+        input : str
+            Path to the input PDB file (required).
+        output : str
+            Name of the output folder (default: 'output').
+        type : str
+            ENM model type; 'ca' for Cα-only or 'heavy' for all heavy
+            atoms (default: 'ca').
+        cutoff : float or None
+            Interaction cutoff in Å.  If None, defaults to 15.0 Å for
+            'ca' and 12.0 Å for 'heavy'.
+        spring_constant : float
+            Harmonic spring constant in kcal mol⁻¹ Å⁻² (default: 1.0).
+        max_modes : int or None
+            Number of non-rigid modes to compute.  If None, the full
+            spectrum is computed.
+        output_modes : int
+            Number of modes to save to disk and analyse (default: 10).
+        no_nm_vec : bool
+            False when --no_nm_vec is supplied, disabling XYZ
+            eigenvector output; True otherwise.
+        no_nm_trj : bool
+            False when --no_nm_trj is supplied, disabling PDB
+            trajectory output; True otherwise.
+        no_collectivity : bool
+            False when --no_collectivity is supplied; True
+            otherwise.
+        no_contributions : bool
+            False when --no_contributions is supplied; True
+            otherwise.
+        no_rmsf : bool
+            False when --no_rmsf is supplied; True otherwise.
+        no_dccm : bool
+            False when --no_dccm is supplied; True otherwise.
+        no_gpu : bool
+            False when --no_gpu is supplied, disabling GPU
+            acceleration; True otherwise.
+
+    Raises
+    ------
+    SystemExit
+        If required arguments are missing or an invalid choice is supplied
+        (handled internally by argparse).
+    """
     parser = argparse.ArgumentParser(description='Elastic Network Model Normal Mode Analysis')
 
     # Required arguments
@@ -132,7 +200,39 @@ def create_system(pdb_file, model_type='ca', cutoff=None, spring_constant=1.0, o
         raise ValueError("Invalid model type. Choose 'ca' or 'heavy'")
 
 def _create_ca_system(pdb_file, cutoff, spring_constant, output_prefix):
-    """Create a Cα-only Elastic Network Model system."""
+    """
+    Create a Cα-only ENM system from a PDB file.
+
+    Extracts Cα atoms, assigns uniform carbon masses (12.011 Da), and
+    connects pairs within [2.9 Å, cutoff] with a harmonic spring.  The
+    reduced structure is saved to {output_prefix}_ca_structure.pdb.
+
+    Parameters
+    ----------
+    pdb_file : str
+        Path to the input PDB file.
+    cutoff : float
+        Maximum Cα–Cα distance in Å for ENM bond formation.
+    spring_constant : float
+        Harmonic spring constant in kcal mol⁻¹ Å⁻².
+    output_prefix : str
+        Prefix used when writing the Cα PDB output file.
+
+    Returns
+    -------
+    system : openmm.System
+        System with one particle per Cα atom and a CustomBondForce
+        encoding the ENM potential.
+    topology : openmm.app.Topology
+        Reduced topology containing only Cα atoms.
+    positions : openmm.unit.Quantity
+        Cα positions in nanometres.
+
+    Raises
+    ------
+    ValueError
+        If no Cα atoms are found in the PDB file.
+    """
     logger.info("Creating Cα-only system using Elastic Network Model...")
     pdb = app.PDBFile(pdb_file)
 
@@ -209,7 +309,39 @@ def _create_ca_system(pdb_file, cutoff, spring_constant, output_prefix):
     return system, new_topology, positions_quantity
 
 def _create_heavy_system(pdb_file, cutoff, spring_constant, output_prefix):
-    """Create a heavy-atom Elastic Network Model system."""
+    """
+    Create a heavy-atom ENM system from a PDB file.
+
+    Extracts all non-hydrogen atoms, assigns element-specific masses, and
+    connects pairs within [2.0 Å, cutoff] with a harmonic spring.  The
+    reduced structure is saved to {output_prefix}_heavy.pdb.
+
+    Parameters
+    ----------
+    pdb_file : str
+        Path to the input PDB file.
+    cutoff : float
+        Maximum inter-atom distance in Å for ENM bond formation.
+    spring_constant : float
+        Harmonic spring constant in kcal mol⁻¹ Å⁻².
+    output_prefix : str
+        Prefix used when writing the heavy-atom PDB output file.
+
+    Returns
+    -------
+    system : openmm.System
+        System with one particle per heavy atom and a CustomBondForce
+        encoding the ENM potential.
+    topology : openmm.app.Topology
+        Reduced topology containing only heavy atoms.
+    positions : openmm.unit.Quantity
+        Heavy-atom positions in nanometres.
+
+    Raises
+    ------
+    ValueError
+        If no heavy atoms are found in the PDB file.
+    """
     logger.info("Creating heavy-atom system using Elastic Network Model...")
     pdb = app.PDBFile(pdb_file)
 
@@ -275,281 +407,376 @@ def _create_heavy_system(pdb_file, cutoff, spring_constant, output_prefix):
     system.addForce(mm.CMMotionRemover())
 
     # Save heavy atom structure
-    heavy_pdb_file = f"{output_prefix}_aa_structure.pdb"
+    heavy_pdb_file = f"{output_prefix}_heavy.pdb"
     with open(heavy_pdb_file, 'w') as f:
         app.PDBFile.writeFile(new_topology, positions_quantity, f)
     logger.info(f"Heavy-atom structure saved to {heavy_pdb_file}\n")
 
     return system, new_topology, positions_quantity
 
-@njit(float64[:,:](float64[:,:], float64[:,:], float64, int32), parallel=True, fastmath=True)
-def compute_hessian(pos_array, bonds, k_val, n_particles):
+def _extract_bonds_array(enm_force):
     """
-    Compute the Hessian matrix for an Elastic Network Model using CPU parallelization.
+    Extract bond atom-index pairs from an OpenMM CustomBondForce into a
+    compact integer array.
 
     Parameters
     ----------
-    pos_array : ndarray
-        Array of particle positions (N×3)
-    bonds : ndarray
-        Array of bonds with format [i, j, r0] for each bond
-    k_val : float
-        Spring constant
-    n_particles : int
-        Number of particles in the system
+    enm_force : openmm.CustomBondForce
+        The ENM bond force to read connectivity from.
 
     Returns
     -------
-    hessian : ndarray
-        The computed Hessian matrix (3N×3N)
+    ij : ndarray, shape (n_bonds, 2), dtype intp
+        Zero-based atom index pairs [i, j] for each bond.
     """
-    n_dof = 3 * n_particles
-    hessian = np.zeros((n_dof, n_dof), dtype=np.float64)
+    nb = enm_force.getNumBonds()
+    ij = np.empty((nb, 2), dtype=np.intp)
+    for b in range(nb):
+        i, j, _ = enm_force.getBondParameters(b)
+        ij[b, 0] = i
+        ij[b, 1] = j
+    return ij
 
-    for idx in prange(bonds.shape[0]):
-        i = int(bonds[idx, 0])
-        j = int(bonds[idx, 1])
-        r0 = bonds[idx, 2]
-
-        r_ij = pos_array[j] - pos_array[i]
-        dist = np.sqrt(r_ij[0]**2 + r_ij[1]**2 + r_ij[2]**2)
-
-        if dist > 1e-6:
-            e_ij = r_ij / dist
-            block = k_val * np.outer(e_ij, e_ij)
-
-            i3 = 3 * i
-            j3 = 3 * j
-
-            # Update diagonal blocks
-            for a in range(3):
-                for b in range(3):
-                    hessian[i3 + a, i3 + b] += block[a, b]
-                    hessian[j3 + a, j3 + b] += block[a, b]
-
-                    # Update off-diagonal blocks
-                    hessian[i3 + a, j3 + b] -= block[a, b]
-                    hessian[j3 + a, i3 + b] -= block[a, b]
-
-    return hessian
-
-def hessian_enm(system, positions):
+def _build_hessian_cpu(pos, ij, k, n):
     """
-    Build, compute and regularize Hessian matrix for an Elastic Network Model.
+    Assemble the 3N × 3N ENM Hessian on the CPU.
+
+    For each bond (p, q) with unit vector e, four 3×3 blocks are updated:
+    the two diagonal blocks gain k · e⊗e and the two off-diagonal blocks
+    lose it.
+
+    Parameters
+    ----------
+    pos : ndarray, shape (N, 3), float64
+        Atom positions in nanometres.
+    ij : ndarray, shape (n_bonds, 2), dtype intp
+        Zero-based atom index pairs for each bond.
+    k : float
+        Harmonic spring constant in kcal mol⁻¹ nm⁻².
+    n : int
+        Total number of particles N.
+
+    Returns
+    -------
+    H : ndarray, shape (3N, 3N), float64
+        Dense Hessian matrix.
+    """
+    from scipy.sparse import coo_matrix
+
+    p_idx = ij[:, 0]                                    # (n_bonds,)
+    q_idx = ij[:, 1]
+
+    r   = pos[q_idx] - pos[p_idx]                       # (n_bonds, 3)
+    d   = np.linalg.norm(r, axis=1, keepdims=True)      # (n_bonds, 1)
+    e   = r / d                                         # unit vectors
+    B   = k * np.einsum('bi,bj->bij', e, e)             # (n_bonds, 3, 3)
+
+    # Build the 9 (row-offset, col-offset) pairs for a 3×3 block once
+    ai, ci = np.divmod(np.arange(9, dtype=np.intp), 3)  # offsets 0..2
+
+    # Global row/col indices for each of the 4 block contributions
+    rp = (3 * p_idx[:, None] + ai).ravel()
+    cp_ = (3 * p_idx[:, None] + ci).ravel()
+    rq = (3 * q_idx[:, None] + ai).ravel()
+    cq = (3 * q_idx[:, None] + ci).ravel()
+    v  = B.reshape(-1, 9).ravel()                       # (n_bonds*9,)
+
+    rows = np.concatenate([rp, rq, rp, rq])
+    cols = np.concatenate([cp_, cq, cq, cp_])
+    data = np.concatenate([ v,  v, -v, -v])
+
+    n3 = 3 * n
+    return coo_matrix((data, (rows, cols)), shape=(n3, n3),
+                      dtype=np.float64).toarray()
+
+def _build_hessian_gpu(pos, ij, k, n):
+    """
+    Assemble the 3N × 3N ENM Hessian on the GPU
+
+    Parameters
+    ----------
+    pos : ndarray, shape (N, 3), float64
+        Atom positions in nanometres (transferred to GPU internally).
+    ij : ndarray, shape (n_bonds, 2), dtype intp
+        Zero-based atom index pairs for each bond (transferred to GPU
+        internally).
+    k : float
+        Harmonic spring constant in kcal mol⁻¹ nm⁻².
+    n : int
+        Total number of particles N.
+
+    Returns
+    -------
+    H : ndarray, shape (3N, 3N), float64
+        Dense Hessian matrix on the CPU.  Computed on the GPU if available,
+        otherwise falls back to the CPU result.
+    """
+    try:
+        p_gpu  = cp.asarray(ij[:, 0], dtype=cp.intp)
+        q_gpu  = cp.asarray(ij[:, 1], dtype=cp.intp)
+        pos_gpu = cp.asarray(pos, dtype=cp.float64)
+
+        r   = pos_gpu[q_gpu] - pos_gpu[p_gpu]
+        d   = cp.linalg.norm(r, axis=1, keepdims=True)
+        e   = r / d
+        B   = k * cp.einsum('bi,bj->bij', e, e)
+
+        ai, ci = cp.divmod(cp.arange(9, dtype=cp.intp), 3)
+        rp  = (3 * p_gpu[:, None] + ai).ravel()
+        cp_ = (3 * p_gpu[:, None] + ci).ravel()
+        rq  = (3 * q_gpu[:, None] + ai).ravel()
+        cq  = (3 * q_gpu[:, None] + ci).ravel()
+        v   = B.reshape(-1, 9).ravel()
+
+        rows = cp.concatenate([rp, rq, rp, rq])
+        cols = cp.concatenate([cp_, cq, cq, cp_])
+        data = cp.concatenate([v, v, -v, -v])
+
+        n3    = 3 * n
+        H_gpu = coo_gpu((data, (rows, cols)), shape=(n3, n3),
+                         dtype=cp.float64).toarray()
+        H = cp.asnumpy(H_gpu)
+        del H_gpu, pos_gpu, B, e, r
+        cp.get_default_memory_pool().free_all_blocks()
+        return H
+
+    except Exception as exc:
+        logger.warning(f"GPU Hessian failed ({exc}); falling back to CPU.")
+        return _build_hessian_cpu(pos, ij, k, n)
+
+def hessian_enm(system, positions, use_gpu=False):
+    """
+    Build the analytical ENM Hessian matrix (3N × 3N, float64).
+
+    Reads the spring constant and bond list from the system's CustomBondForce,
+    then assembles the second-derivative matrix. The result is symmetrised and
+    given a minimal diagonal regularisation (1 × 10^-10) to stabilise the six
+    rigid-body zero modes.
 
     Parameters
     ----------
     system : openmm.System
-        The system containing the ENM force
+        System containing a CustomBondForce ENM potential.  The first
+        global parameter is taken as the spring constant k.
     positions : openmm.unit.Quantity
-        The positions of particles in the system
+        Reference atomic positions in any OpenMM length unit.
+    use_gpu : bool, optional
+        If True, attempt GPU assembly via CuPy; falls back to CPU on
+        any error (default: False).
 
     Returns
     -------
-    hessian : ndarray
-        The computed Hessian matrix (3N×3N)
+    hessian : ndarray, shape (3N, 3N), float64
+        Symmetrised and regularised Hessian matrix.
 
     Raises
     ------
     ValueError
-        If no ENM force is found in the system
+        If no CustomBondForce is found in the system.
     """
-    n_particles = system.getNumParticles()
-    n_dof = 3 * n_particles
+    n = system.getNumParticles()
 
-    enm_force = next((f for f in system.getForces() if isinstance(f, mm.CustomBondForce)), None)
+    enm_force = next((f for f in system.getForces()
+                      if isinstance(f, mm.CustomBondForce)), None)
     if enm_force is None:
-        raise ValueError("No ENM force found in system")
+        raise ValueError("No CustomBondForce (ENM) found in system.")
 
-    k_val = enm_force.getGlobalParameterDefaultValue(0)
-    num_bonds = enm_force.getNumBonds()
-    pos_array = np.array([[p.x, p.y, p.z] for p in positions.value_in_unit(unit.nanometer)], dtype=np.float64)
+    k   = enm_force.getGlobalParameterDefaultValue(0)
+    ij  = _extract_bonds_array(enm_force)   # (n_bonds, 2)
 
-    logger.info(f"Computing Hessian for {n_particles} particles...")
-    start_time = time.time()
+    # Float64 positions in nm
+    pos = np.array([[p.x, p.y, p.z]
+                    for p in positions.value_in_unit(unit.nanometer)],
+                   dtype=np.float64)
 
-    # Precompute bonds array with fixed memory layout
-    bonds_list = np.empty((num_bonds, 3), dtype=np.float64)
-    for bond_idx in range(num_bonds):
-        i, j, [r0] = enm_force.getBondParameters(bond_idx)
-        bonds_list[bond_idx] = (i, j, r0)
+    logger.info(f"Computing Hessian for {n} particles "
+                f"({ij.shape[0]} bonds, {'GPU' if use_gpu else 'CPU'})...")
+    t0 = time.time()
 
-    # Compute Hessian
-    hessian = compute_hessian(pos_array, bonds_list, k_val, n_particles)
+    builder = _build_hessian_gpu if use_gpu else _build_hessian_cpu
+    H = builder(pos, ij, k, n)
 
-    # Symmetrize and regularize
-    hessian = 0.5 * (hessian + hessian.T)
-    hessian.flat[::n_dof+1] += 1e-8  # Add regularization directly to diagonal
+    # Enforce exact symmetry (removes sub-ULP asymmetry from floating-point ops)
+    H = 0.5 * (H + H.T)
+    # Minimal regularisation — shifts zero modes by ~1e-10, physical modes unaffected
+    np.fill_diagonal(H, H.diagonal() + 1e-10)
 
-    duration = time.time() - start_time
-    logger.info(f"ENM Hessian computed in {duration:.2f} seconds\n")
-
-    return hessian
+    logger.info(f"ENM Hessian computed in {time.time() - t0:.2f} s\n")
+    return H
 
 def mass_weight_hessian(hessian, system):
     """
-    Apply mass-weighting to the Hessian matrix.
+    Apply mass-weighting to the Hessian to produce the dynamical matrix
+    M^-1/2 * H * M^-1/2.
 
     Parameters
     ----------
-    hessian : ndarray
-        The Hessian matrix to mass-weight
+    hessian : ndarray, shape (3N, 3N), float64
+        Raw unweighted Hessian matrix.
     system : openmm.System
-        The system containing particle masses
+        Provides per-particle masses.
 
     Returns
     -------
-    mw_hessian : ndarray
-        The mass-weighted Hessian matrix
+    mw_hessian : ndarray, shape (3N, 3N), float64
+        Mass-weighted dynamical matrix whose eigenvalues are the squared
+        angular frequencies ω².
     """
-    n_particles = system.getNumParticles()
-    masses = np.array([system.getParticleMass(i).value_in_unit(unit.dalton) for i in range(n_particles)])
-    masses[masses == 0] = 1.0  # Avoid division by zero
+    n = system.getNumParticles()
+    masses = np.fromiter(
+        (system.getParticleMass(i).value_in_unit(unit.dalton) for i in range(n)),
+        dtype=np.float64, count=n
+    )
+    masses = np.where(masses > 0.0, masses, 1.0)    # guard zero-mass virtual sites
+    M = np.repeat(1.0 / np.sqrt(masses), 3)         # (3N,) inverse sqrt mass vector
+    return M[:, None] * hessian * M[None, :]        # O(9N²) element-wise, no alloc
 
-    inv_sqrt_m = 1 / np.sqrt(masses)
-    m_vector = np.repeat(inv_sqrt_m, 3)
-
-    # Diagonal multiplication using sparse matrices
-    D = diags(m_vector, 0)
-    return D @ hessian @ D
-
-def gpu_diagonalization(hessian, n_modes=None):
+def _diagonalize_cpu(H, n_modes):
     """
-    Diagonalize the Hessian matrix using GPU acceleration.
+    Diagonalise a real symmetric matrix using scipy.linalg.eigh.
 
     Parameters
     ----------
-    hessian : ndarray
-        The Hessian matrix to diagonalize
-    n_modes : int, optional
-        Number of modes to compute. If None, computes all modes.
+    H : ndarray, shape (3N, 3N), float64
+        Real symmetric matrix to diagonalise. Overwritten in place.
+    n_modes : int or None
+        Number of non-rigid modes requested.  When not None, computes
+        the lowest n_modes + 6 eigenpairs; when None, computes the
+        full spectrum.
 
     Returns
     -------
-    eigenvalues : ndarray
-        The eigenvalues of the Hessian matrix
-    eigenvectors : ndarray
-        The eigenvectors of the Hessian matrix
+    eigenvalues : ndarray, shape (K,), float64
+        Eigenvalues in ascending order.
+    eigenvectors : ndarray, shape (3N, K), float64
+        Corresponding normalised eigenvectors as columns.
     """
-    # Use memory pool for efficient GPU memory management
-    mem_pool = cp.get_default_memory_pool()
-    pinned_mem_pool = cp.get_default_pinned_memory_pool()
+    n = H.shape[0]
+    if n_modes is not None:
+        # Request the first (n_modes + 6) eigenvalues to cover rigid-body modes
+        end = min(n_modes + 5, n - 1)     # subset_by_index is inclusive, 0-based
+        return eigh(H, subset_by_index=[0, end],
+                    driver='evr', overwrite_a=True, check_finite=False)
+    else:
+        return eigh(H, driver='evd', overwrite_a=True, check_finite=False)
 
-    # Transfer Hessian to GPU using pinned memory for faster transfer
+def _diagonalize_gpu(H, n_modes):
+    """
+    Diagonalise a real symmetric matrix on the GPU.
+
+    Parameters
+    ----------
+    H : ndarray, shape (3N, 3N), float64
+        Real symmetric matrix to diagonalise (transferred to GPU internally).
+    n_modes : int or None
+        Number of non-rigid modes requested.  When not None, retains
+        only the lowest n_modes + 6 eigenpairs before CPU transfer.
+
+    Returns
+    -------
+    eigenvalues : ndarray, shape (K,), float64
+        Eigenvalues in ascending order, on the CPU.
+    eigenvectors : ndarray, shape (3N, K), float64
+        Corresponding normalised eigenvectors as columns, on the CPU.
+
+    Raises
+    ------
+    cupy.cuda.runtime.CUDARuntimeError
+        On CUDA failure; callers should catch and fall back to
+        _diagonalize_cpu.
+    ImportError
+        If CuPy is not installed.
+    """
+    import cupy as cp
+    pool = cp.get_default_memory_pool()
+
     with cp.cuda.Device(0):
-        # Use float32 for faster computation if precision allows
-        if hessian.shape[0] > 3000:
-            hessian_gpu = cp.array(hessian, dtype=cp.float32)
-        else:
-            hessian_gpu = cp.array(hessian, dtype=cp.float64)
-
-        # Free CPU memory immediately
-        del hessian
+        H_gpu = cp.asarray(H, dtype=cp.float64)
+        w_gpu, v_gpu = cp.linalg.eigh(H_gpu, UPLO='L')
+        del H_gpu
+        pool.free_all_blocks()
 
         if n_modes is not None:
-            # Use partial diagonalization for specified number of modes
-            n_modes = min(n_modes + 6, hessian_gpu.shape[0])
-            eigenvalues, eigenvectors = cp.linalg.eigh(
-                hessian_gpu,
-                UPLO='L',
-                subset_by_index=[0, n_modes-1]
-            )
-        else:
-            # Full diagonalization
-            eigenvalues, eigenvectors = cp.linalg.eigh(hessian_gpu, UPLO='L')
+            keep = min(n_modes + 6, w_gpu.shape[0])
+            w_gpu = w_gpu[:keep]
+            v_gpu = v_gpu[:, :keep]
 
-        # Free GPU memory immediately after computation
-        del hessian_gpu
-        mem_pool.free_all_blocks()
-        pinned_mem_pool.free_all_blocks()
+        w = cp.asnumpy(w_gpu)
+        v = cp.asnumpy(v_gpu)
+        del w_gpu, v_gpu
+        pool.free_all_blocks()
 
-        # Transfer results back to CPU using pinned memory
-        eigenvalues_cpu = cp.asnumpy(eigenvalues, stream=cp.cuda.Stream.null)
-        eigenvectors_cpu = cp.asnumpy(eigenvectors, stream=cp.cuda.Stream.null)
-
-        # Free GPU memory
-        del eigenvalues, eigenvectors
-
-    return eigenvalues_cpu, eigenvectors_cpu
+    return w, v
 
 def compute_normal_modes(hessian, n_modes=None, use_gpu=False):
     """
-    Compute normal modes by diagonalizing the Hessian matrix.
+    Diagonalise the mass-weighted Hessian and return sorted normal modes.
+
 
     Parameters
     ----------
-    hessian : ndarray
-        The Hessian matrix to diagonalize
+    hessian : ndarray, shape (3N, 3N), float64
+        Mass-weighted Hessian (dynamical matrix).
     n_modes : int, optional
-        Number of modes to compute. If None, computes all modes.
+        Number of non-rigid modes to compute.  If None, the full spectrum
+        is computed.
     use_gpu : bool, optional
-        Whether to use GPU acceleration for diagonalization
+        Attempt GPU diagonalisation via CuPy; falls back to CPU on any error
+        (default: False).
 
     Returns
     -------
-    frequencies : ndarray
-        The frequencies of the normal modes
-    modes : ndarray
-        The normal mode vectors
-    eigenvalues : ndarray
-        The eigenvalues of the Hessian matrix
+    frequencies : ndarray, shape (K,), float64
+        Signed angular frequencies: ω_i = sign(λ_i) · √|λ_i|.  Negative
+        values flag imaginary frequencies (structural instabilities).
+    modes : ndarray, shape (3N, K), float64
+        Normalised eigenvectors sorted by ascending eigenvalue.
+    eigenvalues : ndarray, shape (K,), float64
+        Raw eigenvalues sorted ascending.  eigenvalues[i] and
+        modes[:, i] correspond to the same mode.
     """
-    start_time = time.time()
+    t0 = time.time()
 
-    if use_gpu and cp.is_available():
-        logger.info("Diagonalizing mass-weighted Hessian using GPU acceleration...")
+    if use_gpu:
+        logger.info("Diagonalising mass-weighted Hessian on GPU...")
         try:
-            eigenvalues, eigenvectors = gpu_diagonalization(hessian, n_modes)
-        except Exception as e:
-            logger.warning(f"GPU diagonalization failed: {e}. Falling back to CPU.")
+            w, v = _diagonalize_gpu(hessian, n_modes)
+        except Exception as exc:
+            logger.warning(f"GPU diagonalisation failed ({exc}); falling back to CPU.")
             use_gpu = False
 
-    if not use_gpu or not cp.is_available():
-        # CPU diagonalization with optimized parameters
-        if n_modes is not None:
-            logger.info("Diagonalizing mass-weighted Hessian using CPU optimization...")
-            n_modes = min(n_modes + 6, hessian.shape[0])
-            eigenvalues, eigenvectors = eigh(
-                hessian,
-                subset_by_index=[0, n_modes-1],
-                driver='evr',       # Fastest driver for symmetric matrices
-                overwrite_a=True,
-                check_finite=False  # Skip finite check for performance
-            )
-        else:
-            logger.info("Diagonalizing mass-weighted Hessian using CPU...")
-            eigenvalues, eigenvectors = eigh(
-                hessian,
-                driver='evr',       # Fastest driver for symmetric matrices
-                overwrite_a=True,
-                check_finite=False  # Skip finite check for performance
-            )
+    if not use_gpu:
+        logger.info("Diagonalising mass-weighted Hessian on CPU...")
+        w, v = _diagonalize_cpu(hessian, n_modes)
 
-    duration = time.time() - start_time
-    logger.info(f"Diagonalization completed in {duration:.2f} seconds\n")
+    logger.info(f"Diagonalisation completed in {time.time() - t0:.2f} s\n")
 
-    # Calculate frequencies from eigenvalues
-    abs_evals = np.abs(eigenvalues)
-    threshold = np.max(abs_evals) * 1e-10
-    valid_idx = abs_evals > threshold
+    # eigh returns ascending order, but guarantee it after any potential GPU sort
+    idx = np.argsort(w)
+    w   = w[idx]
+    v   = v[:, idx]
 
-    frequencies = np.sqrt(np.abs(eigenvalues[valid_idx]))
-    valid_modes = eigenvectors[:, valid_idx]
+    # Signed frequency: ω = sign(λ)·√|λ|.  Negative → imaginary (instability).
+    frequencies = np.sign(w) * np.sqrt(np.abs(w))
 
-    sort_idx = np.argsort(frequencies)
-    sorted_frequencies = frequencies[sort_idx]
-    sorted_modes = valid_modes[:, sort_idx]
+    # Warn if significant imaginary modes appear beyond the 6 rigid-body ones
+    max_abs = np.abs(w).max() if w.size else 1.0
+    if np.any(w[6:] < -1e-6 * max_abs):
+        logger.warning(
+            "Negative eigenvalues found beyond mode 6 — the structure may "
+            "not be at a true energy minimum.  Check for steric clashes."
+        )
 
-    return sorted_frequencies, sorted_modes, eigenvalues
+    return frequencies, v, w
 
 def convert_hetatm_to_atom(pdb_file):
     """
-    Convert HETATM records to ATOM in PDB files for compatibility with visualization tools.
+    Replace HETATM records with ATOM records in a PDB file in place.
 
     Parameters
     ----------
     pdb_file : str
-        Path to the PDB file to convert
+        Path to the PDB file to modify.  Overwritten in place.
     """
     with open(pdb_file, 'r') as f:
         lines = f.readlines()
@@ -566,26 +793,29 @@ def convert_hetatm_to_atom(pdb_file):
     with open(pdb_file, 'w') as f:
         f.writelines(new_lines)
 
-def write_nm_vectors(modes, frequencies, system, topology, output_prefix, n_modes=10, start_mode=7):
+def write_nm_vectors(modes, frequencies, system, topology, output_prefix, n_modes=10, start_mode=6):
     """
-    Write normal mode eigenvectors to separate XYZ files.
+    Write normal mode eigenvectors to XYZ-format text files, one per mode.
 
     Parameters
     ----------
-    modes : ndarray
-        The normal mode vectors (3N×M)
-    frequencies : ndarray
-        The frequencies of the normal modes
+    modes : ndarray, shape (3N, M), float64
+        Normal mode eigenvectors; column i is mode i (0-based).
+    frequencies : ndarray, shape (M,), float64
+        Signed angular frequencies in internal units; converted to cm⁻¹
+        (factor 108.58) for the file header.
     system : openmm.System
-        The system containing particle information
+        Used to query the total particle count.
     topology : openmm.app.Topology
-        The topology of the system
+        Used to retrieve the element symbol for each atom.
     output_prefix : str
-        Prefix for output XYZ files
+        Directory and filename prefix for output XYZ files.
     n_modes : int, optional
-        Number of modes to write (default: 10)
+        Number of modes to write (default: 10).  Clamped to available
+        modes.
     start_mode : int, optional
-        First mode to write (default: 7, skipping first 6 rigid-body modes)
+        Zero-based index of the first mode to write (default: 6, the
+        second non-rigid mode after the six rigid-body modes at 0–5).
     """
     n_particles = system.getNumParticles()
 
@@ -619,34 +849,37 @@ def write_nm_vectors(modes, frequencies, system, topology, output_prefix, n_mode
                 x, y, z = mode_vector[i]
                 f.write(f"{elements[i]:2s} {x:14.10f} {y:14.10f} {z:14.10f}\n")
 
-def write_nm_trajectories(topology, positions, modes, frequencies, output_prefix, system, model_type, n_modes=10, start_mode=7, amplitude=4, num_frames=34):
+def write_nm_trajectories(topology, positions, modes, frequencies, output_prefix, system, model_type, n_modes=10, start_mode=6, amplitude=4, num_frames=34):
     """
-    Write PDB trajectories showing the motion along multiple normal modes.
+    Write multi-frame PDB trajectories visualising atomic motion along normal
+    modes.
 
     Parameters
     ----------
     topology : openmm.app.Topology
-        The topology of the system
+        Topology of the system, used for PDB record writing.
     positions : openmm.unit.Quantity
-        The equilibrium positions of particles
-    modes : ndarray
-        The normal mode vectors (3N×M)
-    frequencies : ndarray
-        The frequencies of the normal modes
+        Equilibrium atomic positions in any OpenMM length unit.
+    modes : ndarray, shape (3N, M), float64
+        Normal mode eigenvectors; column i is mode i (0-based).
+    frequencies : ndarray, shape (M,), float64
+        Signed angular frequencies in internal units; used only for log
+        output (converted to cm⁻¹).
     output_prefix : str
-        Prefix for output PDB files
+        Directory and filename prefix for the output PDB files.
     system : openmm.System
-        The system containing particle masses
+        Used to obtain per-particle masses for mass-weighting displacements.
     model_type : str
-        Type of model ('ca' or 'heavy')
+        ENM model type ('ca' or 'heavy'); used for logging only.
     n_modes : int, optional
-        Number of modes to write (default: 10)
+        Number of modes for which to write trajectories (default: 10).
+        Clamped to available modes.
     start_mode : int, optional
-        First mode to write (default: 7, skipping first 6 rigid-body modes)
-    amplitude : float
-        The amplitude of motion to visualize
+        Zero-based index of the first mode to write (default: 6).
+    amplitude : float, optional
+        Peak displacement amplitude in Å (default: 4).
     num_frames : int, optional
-        Number of frames in the trajectory
+        Total number of MODEL frames per trajectory (default: 34).
     """
     n_particles = system.getNumParticles()
 
@@ -722,39 +955,44 @@ def compute_collectivity(mode_vector, n_atoms):
 
     Parameters
     ----------
-    mode_vector : ndarray
-        The normal mode vector
+    mode_vector : ndarray, shape (3N,), float64
+        Eigenvector of the mode.  Need not be pre-normalised.
     n_atoms : int
-        Number of atoms in the system
+        Total number of atoms N.
 
     Returns
     -------
     collectivity : float
-        The collectivity value (0 to 1)
+        Collectivity in (0, 1].  Returns 0.0 if the mode vector is zero.
     """
-    u = mode_vector.reshape(n_atoms, 3)
-    norms = np.linalg.norm(u, axis=1)
-    p = norms**2
-    p += 1e-12  # Avoid log(0)
-    entropy = -np.sum(p * np.log(p))
+    u     = mode_vector.reshape(n_atoms, 3)
+    norms = np.linalg.norm(u, axis=1)   # |Δr_i| for each atom
+    p     = norms ** 2
+    total = p.sum()
+    if total < 1e-30:
+        return 0.0
+    p /= total  # normalise: Σ p_i = 1
+    # Mask true zeros to avoid log(0); they contribute 0 to entropy anyway
+    mask  = p > 0.0
+    entropy = -np.dot(p[mask], np.log(p[mask]))
     return np.exp(entropy) / n_atoms
 
 def write_collectivity(frequencies, modes, system, output_file, n_modes=20):
     """
-    Write mode collectivities to a CSV file.
+    Write mode collectivities into a CSV file.
 
     Parameters
     ----------
-    frequencies : ndarray
-        The frequencies of the normal modes
-    modes : ndarray
-        The normal mode vectors
+    frequencies : ndarray, shape (M,), float64
+        Signed angular frequencies in internal units.
+    modes : ndarray, shape (3N, M), float64
+        Normal mode eigenvectors; column i is mode i (0-based).
     system : openmm.System
-        The system containing particle masses
+        Used to obtain per-particle masses for mass-weighting.
     output_file : str
-        Path to the output CSV file
+        Path to the output CSV file.  Overwritten if it already exists.
     n_modes : int, optional
-        Number of modes to include in the output
+        Number of non-rigid modes to include (default: 20).
     """
     n_particles = system.getNumParticles()
     masses = [system.getParticleMass(i).value_in_unit(unit.dalton) for i in range(n_particles)]
@@ -782,16 +1020,18 @@ def write_collectivity(frequencies, modes, system, output_file, n_modes=20):
 
 def plot_mode_contributions(eigenvalues, output_file=None, n_modes=10):
     """
-    Plot the cumulative proportion of variance explained by the first N non-rigid modes.
+    Plot per-mode and cumulative variance contributions for the first N
+    non-rigid normal modes.
 
     Parameters
     ----------
-    eigenvalues : ndarray
-        The eigenvalues of the Hessian matrix
-    n_modes : int, optional
-        Number of modes to include in the plot
+    eigenvalues : ndarray, shape (K,), float64
+        Sorted eigenvalues as returned by compute_normal_modes.
     output_file : str, optional
-        Path to save the plot. If None, displays the plot.
+        Path to save the figure (PNG, 300 dpi).  If None, displays
+        interactively.
+    n_modes : int, optional
+        Number of non-rigid modes to include in the plot (default: 10).
     """
     # Exclude rigid-body modes (first 6 near-zero eigenvalues)
     non_rigid_evals = eigenvalues[6:]
@@ -854,26 +1094,29 @@ def plot_mode_contributions(eigenvalues, output_file=None, n_modes=10):
 
 def plot_atomic_fluctuations(system, eigenvalues, modes, topology, output_file=None, temperature=300, n_modes=None, start_mode=6):
     """
-    Plot residue fluctuations (RMSF) calculated from normal modes.
+    Compute per-residue RMSF from normal modes and plot as a line graph.
 
     Parameters
     ----------
     system : openmm.System
-        The system containing particle masses
-    eigenvalues : ndarray
-        The eigenvalues of the Hessian matrix
-    modes : ndarray
-        The normal mode vectors
+        Used to obtain per-particle masses.
+    eigenvalues : ndarray, shape (K,), float64
+        Sorted eigenvalues from compute_normal_modes.
+    modes : ndarray, shape (3N, K), float64
+        Normal mode eigenvectors; eigenvalues[i] and modes[:, i]
+        correspond to the same mode.
     topology : openmm.app.Topology
-        The topology of the system
+        Used to map atoms to residues for grouping and axis labelling.
     output_file : str, optional
-        Path to save the plot. If None, displays the plot.
+        Path to save the figure (PNG, 300 dpi).  If None, displays
+        interactively.
     temperature : float, optional
-        Temperature in Kelvin for fluctuation calculation
+        Temperature in Kelvin (default: 300).
     n_modes : int, optional
-        Number of modes to include in calculation. If None, uses all non-rigid modes.
+        Number of non-rigid modes to include.  If None, uses all modes
+        from start_mode onward.
     start_mode : int, optional
-        First mode to include (default: 6, skipping first 6 rigid-body modes)
+        Zero-based index of the first mode to include (default: 6).
     """
     n_particles = system.getNumParticles()
 
@@ -966,30 +1209,41 @@ def plot_atomic_fluctuations(system, eigenvalues, modes, topology, output_file=N
 
 def plot_residue_cross_correlation(system, eigenvalues, modes, topology, output_file=None, temperature=300, n_modes=None, start_mode=6, use_gpu=True, use_multithreading=True):
     """
-    Compute and plot residue dynamical cross-correlation matrix calculated from normal modes.
+    Compute and plot the residue Dynamical Cross-Correlation Matrix (DCCM).
 
     Parameters
     ----------
     system : openmm.System
-        The system containing particle masses
-    eigenvalues : ndarray
-        The eigenvalues of the Hessian matrix
-    modes : ndarray
-        The normal mode vectors
+        Used to obtain per-particle masses.
+    eigenvalues : ndarray, shape (K,), float64
+        Sorted eigenvalues from compute_normal_modes.
+    modes : ndarray, shape (3N, K), float64
+        Normal mode eigenvectors; eigenvalues[i] and modes[:, i]
+        correspond to the same mode.
     topology : openmm.app.Topology
-        The topology of the system
+        Used to map atoms to residues and to label heatmap axes.
     output_file : str, optional
-        Path to save the plot. If None, displays the plot.
+        Path to save the figure (PNG, 300 dpi) and the matrix (.npy).
+        If None, displays the figure interactively.
     temperature : float, optional
-        Temperature in Kelvin for correlation calculation
+        Temperature in Kelvin (default: 300).
     n_modes : int, optional
-        Number of modes to include in calculation
+        Number of non-rigid modes to include.  If None, uses all modes
+        from start_mode onward.
     start_mode : int, optional
-        First mode to include (default: 6, skipping first 6 rigid-body modes)
+        Zero-based index of the first mode to include (default: 6).
     use_gpu : bool, optional
-        Whether to use GPU acceleration for calculation
+        Use CuPy for GPU-accelerated matrix operations if available;
+        falls back to CPU on any error (default: True).
     use_multithreading : bool, optional
-        Whether to use multithreading for CPU calculation
+        Reserved for future use; the CPU path is already NumPy-vectorised
+        (default: True).
+
+    Raises
+    ------
+    RuntimeError
+        If no valid eigenvalues are found in the selected mode range (GPU
+        path only).
     """
     start_time = time.time()
 
@@ -1029,44 +1283,41 @@ def plot_residue_cross_correlation(system, eigenvalues, modes, topology, output_
     if use_gpu and cp.is_available():
         logger.info("Using GPU acceleration for DCCM calculation...")
         try:
-            # Transfer data to GPU
-            masses_gpu = cp.array(masses)
-            eigenvalues_gpu = cp.array(eigenvalues[start_mode:start_mode+n_modes])
-            modes_gpu = cp.array(modes[:, start_mode:start_mode+n_modes])
-            R_gpu = cp.array(R)
+            evals_slice = eigenvalues[start_mode:start_mode + n_modes]
+            valid_mask  = np.abs(evals_slice) > 1e-10
+            evals_valid = evals_slice[valid_mask]
+            mode_start_valid = start_mode + np.where(valid_mask)[0][0] if valid_mask.any() else None
 
-            # Precompute mass factors on GPU
-            mass_factor_gpu = 1 / cp.sqrt(masses_gpu)
+            if mode_start_valid is None:
+                raise RuntimeError("No valid eigenvalues in selected mode range.")
 
-            # Initialize GPU correlation matrix
-            correlation_matrix_gpu = cp.zeros((n_residues, n_residues))
+            # Indices of valid modes (in full modes array)
+            valid_mode_idx = start_mode + np.where(valid_mask)[0]
 
-            # Calculate contribution from each mode on GPU
-            for mode_idx in range(n_modes):
-                # Skip near-zero eigenvalues to avoid division by zero
-                if cp.abs(eigenvalues_gpu[mode_idx]) < 1e-10:
-                    continue
+            w_gpu   = cp.asarray(k_B * temperature / evals_valid, dtype=cp.float64) # (M,)
+            mf_gpu  = cp.asarray(mass_factor, dtype=cp.float64)                     # (N,)
+            R_gpu   = cp.asarray(R, dtype=cp.float64)                               # (N, n_res)
+            M_valid = len(evals_valid)
 
-                # Get the mode vector and reshape to (n_particles, 3)
-                mode_vector = modes_gpu[:, mode_idx].reshape(n_particles, 3)
+            # modes shape: (3N, M_valid); we need per-xyz slices of shape (N, M_valid)
+            atom_corr_gpu = cp.zeros((n_particles, n_particles), dtype=cp.float64)
+            for alpha in range(3):
+                # Row indices for component alpha: alpha, 3+alpha, 6+alpha, ...
+                rows_alpha = np.arange(alpha, 3 * n_particles, 3)
+                U_alpha = cp.asarray(
+                    modes[np.ix_(rows_alpha, valid_mode_idx)], dtype=cp.float64
+                )  # (N, M_valid)
+                # Mass-weight each atom's displacement in this component
+                U_alpha *= mf_gpu[:, None]
+                # Weighted outer product: Σ_m w_m · u_iα u_jα  = (U_alpha * w) @ U_alpha.T
+                atom_corr_gpu += cp.dot(U_alpha * w_gpu[None, :], U_alpha.T)
 
-                # Calculate mass-weighted vectors
-                weighted_vectors = mode_vector * mass_factor_gpu[:, cp.newaxis]
-
-                # Calculate the correlation matrix for this mode
-                # C = (k_B * T / ω²) * (U @ U.T) where U is mass-weighted
-                factor = k_B * temperature / eigenvalues_gpu[mode_idx]
-                atom_corr_matrix = factor * cp.dot(weighted_vectors, weighted_vectors.T)
-
-                # Aggregate to residue level using matrix multiplication
-                # R.T @ atom_corr_matrix @ R
-                residue_corr_matrix = cp.dot(cp.dot(R_gpu.T, atom_corr_matrix), R_gpu)
-
-                # Add to total correlation matrix
-                correlation_matrix_gpu += residue_corr_matrix
-
-            # Transfer result back to CPU
+            # Aggregate to residue level: C_res = R.T @ C_atom @ R
+            correlation_matrix_gpu = cp.dot(cp.dot(R_gpu.T, atom_corr_gpu), R_gpu)
             correlation_matrix = cp.asnumpy(correlation_matrix_gpu)
+
+            del atom_corr_gpu, correlation_matrix_gpu, R_gpu, mf_gpu, w_gpu
+            cp.get_default_memory_pool().free_all_blocks()
 
         except Exception as e:
             logger.warning(f"GPU acceleration failed: {e}. Falling back to CPU.")
@@ -1075,29 +1326,27 @@ def plot_residue_cross_correlation(system, eigenvalues, modes, topology, output_
     if not use_gpu or not cp.is_available():
         logger.info("Using CPU for DCCM calculation...")
 
-        # Use the same matrix-based approach for CPU
-        for mode_idx in range(start_mode, start_mode + n_modes):
-            # Skip near-zero eigenvalues to avoid division by zero
-            if abs(eigenvalues[mode_idx]) < 1e-10:
-                continue
+        # Fully vectorised CPU path — mirrors the GPU logic but uses NumPy.
+        # Select valid modes and corresponding eigenvalues.
+        evals_slice = eigenvalues[start_mode:start_mode + n_modes]
+        valid_mask  = np.abs(evals_slice) > 1e-10
+        evals_valid = evals_slice[valid_mask]
+        valid_mode_idx = start_mode + np.where(valid_mask)[0]
 
-            # Get the mode vector and reshape to (n_particles, 3)
-            mode_vector = modes[:, mode_idx].reshape(n_particles, 3)
+        if valid_mode_idx.size == 0:
+            logger.warning("No valid eigenvalues in selected mode range; DCCM will be zero.")
+        else:
+            w = k_B * temperature / evals_valid    # (M_valid,) weights
 
-            # Calculate mass-weighted vectors
-            weighted_vectors = mode_vector * mass_factor[:, np.newaxis]
+            atom_corr = np.zeros((n_particles, n_particles), dtype=np.float64)
+            for alpha in range(3):
+                rows_alpha = np.arange(alpha, 3 * n_particles, 3)
+                U_alpha = modes[np.ix_(rows_alpha, valid_mode_idx)]     # (N, M_valid)
+            U_alpha = U_alpha * mass_factor[:, None]                    # mass-weight
+                atom_corr += np.dot(U_alpha * w[None, :], U_alpha.T)    # Σ_m w_m u_iα u_jα
 
-            # Calculate the correlation matrix for this mode
-            # C = (k_B * T / ω²) * (U @ U.T) where U is mass-weighted
-            factor = k_B * temperature / eigenvalues[mode_idx]
-            atom_corr_matrix = factor * np.dot(weighted_vectors, weighted_vectors.T)
-
-            # Aggregate to residue level using matrix multiplication
-            # R.T @ atom_corr_matrix @ R
-            residue_corr_matrix = np.dot(np.dot(R.T, atom_corr_matrix), R)
-
-            # Add to total correlation matrix
-            correlation_matrix += residue_corr_matrix
+            # Aggregate to residue level
+            correlation_matrix = R.T @ atom_corr @ R
 
     # Normalize to get correlation coefficients between -1 and 1
     diag = np.diag(correlation_matrix)
@@ -1148,7 +1397,7 @@ def plot_residue_cross_correlation(system, eigenvalues, modes, topology, output_
 
 def main():
     """
-    Main function to perform Normal Mode Analysis.
+    Entry point for the ENM normal mode analysis pipeline.
 
     Configuration is set via the CONFIG dictionary, which includes:
     - PDB_FILE: Input PDB file
@@ -1165,6 +1414,12 @@ def main():
     - PLOT_RMSF: Whether to plot modes RMSF
     - PLOT_DCCM: Whether to build and plot residue dynamical cross correlation matrix
     - USE_GPU: Whether to use GPU acceleration
+
+    Raises
+    ------
+    SystemExit
+        Exits with code 1 on any unhandled exception; full traceback is
+        printed to stderr.
     """
     # Parse command-line arguments
     args = parse_arguments()
@@ -1209,7 +1464,7 @@ def main():
         if CONFIG["MODEL_TYPE"] == 'ca':
             prefix = "ca"
         else:
-            prefix = "aa"
+            prefix = "heavy"
 
         # Create system
         system, topology, positions = create_system(
@@ -1223,7 +1478,8 @@ def main():
         # Compute Hessian
         hessian = hessian_enm(
             system,
-            positions
+            positions,
+            use_gpu=CONFIG["USE_GPU"]
         )
 
         # Mass-weight Hessian
