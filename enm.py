@@ -32,14 +32,17 @@ class AnsiColorFormatter(logging.Formatter):
         color = self.COLORS.get(record.levelname, self.RESET_COLOR)
         return f"{color}{log_message}{self.RESET_COLOR}"
 
+# Set up logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+# Console handler with color formatting
 console_handler = logging.StreamHandler()
 console_formatter = AnsiColorFormatter("..:ENM> {levelname}: {message}", style="{")
 console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
 
+# File handler for enm.out
 file_handler = logging.FileHandler('enm.out')
 file_formatter = logging.Formatter("{asctime} ..:ENM> {levelname}: {message}", datefmt="%Y-%m-%d %H:%M", style="{")
 file_handler.setFormatter(file_formatter)
@@ -49,9 +52,16 @@ def parse_arguments():
     """
     Parse command-line arguments for the ENM analysis.
     """
-    parser = argparse.ArgumentParser(description='Elastic Network Model Normal Mode Analysis')
+    parser = argparse.ArgumentParser(
+        description='Elastic Network Model Normal Mode Analysis',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
 
-    parser.add_argument('-i', '--input', required=True, help='Input PDB file')
+    # Required arguments
+    parser.add_argument('-i', '--input', default=None,
+                        help='Input PDB file (required for normal ENM computation)')
+
+    # Optional arguments with defaults
     parser.add_argument('-o', '--output', default='output', help='Output folder name')
     parser.add_argument('-t', '--type', choices=['ca', 'heavy'], default='ca',
                        help='Model type: ca (Cα-only) or heavy (heavy atoms). Default: ca')
@@ -63,7 +73,13 @@ def parse_arguments():
                        help='Number of non-rigid modes to compute. Default: all modes')
     parser.add_argument('-n', '--output_modes', type=int, default=10,
                        help='Number of modes to save and analyze. Default: 10 modes')
+    parser.add_argument('-w', '--write_modes', metavar='MODES', default=None,
+        help=('Write mode vectors/trajectories from a previous ENM run. Accepts comma-separated integers and '
+            'inclusive ranges (start:end). Requires -o pointing to an existing output directory. '
+            'Examples: "26,41"  "7:10"  "42,44:50". Use --no_nm_trj to skip trajectory writing and output only vectors.')
+    )
 
+    # Boolean flags to enable/disable features
     parser.add_argument('--no_nm_vec', action='store_false', help='Disable writing mode vectors')
     parser.add_argument('--no_nm_trj', action='store_false', help='Disable writing mode trajectories')
     parser.add_argument('--no_collectivity', action='store_false', help='Disable collectivity calculation')
@@ -72,7 +88,15 @@ def parse_arguments():
     parser.add_argument('--no_dccm', action='store_false', help='Disable DCCM plot')
     parser.add_argument('--no_gpu', action='store_false', help='Disable GPU acceleration')
 
-    return parser.parse_args()
+
+    args = parser.parse_args()
+
+    # -i is mandatory for a normal ENM run; -w bypasses the full computation
+    if args.write_modes is None and args.input is None:
+        parser.error("argument -i/--input is required for normal ENM computation "
+                     "(omit -i only when using -w/--write_modes)")
+
+    return args
 
 def create_system(pdb_file, model_type='ca', cutoff=None, spring_constant=1.0, output_prefix="input"):
     """
@@ -1241,10 +1265,356 @@ def plot_residue_cross_correlation(system, eigenvalues, modes, topology, output_
 
     return correlation_matrix
 
+def parse_mode_string(mode_str):
+    """
+    Convert a mode-selection string into a sorted list of unique mode numbers.
+
+    Accepts comma-separated tokens where each token is either a single integer
+    or an inclusive range in the form ``start:end``.
+
+    Parameters
+    ----------
+    mode_str : str
+        Selection string, e.g. ``"7:10,42,44:50"``.
+
+    Returns
+    -------
+    list[int]
+        Sorted list of unique mode numbers (≥ 1).
+
+    Raises
+    ------
+    SystemExit
+        On malformed input (non-integers, inverted ranges, numbers < 1).
+    """
+    modes = set()
+
+    for raw_token in mode_str.split(','):
+        token = raw_token.strip()
+        if not token:
+            continue
+
+        if ':' in token:
+            parts = token.split(':')
+            if len(parts) != 2:
+                logger.error(
+                    f"Invalid range '{token}': expected exactly one ':' "
+                    f"separating start and end (e.g. '7:10')."
+                )
+                sys.exit(1)
+            try:
+                start, end = int(parts[0]), int(parts[1])
+            except ValueError:
+                logger.error(f"Non-integer value in range '{token}'.")
+                sys.exit(1)
+            if start < 1 or end < 1:
+                logger.error(f"Mode numbers must be ≥ 1 (got '{token}').")
+                sys.exit(1)
+            if start > end:
+                logger.error(
+                    f"Range start must be ≤ end (got '{token}'). "
+                    f"Did you mean '{end}:{start}'?"
+                )
+                sys.exit(1)
+            modes.update(range(start, end + 1))
+
+        else:
+            try:
+                m = int(token)
+            except ValueError:
+                logger.error(f"Non-integer mode number '{token}'.")
+                sys.exit(1)
+            if m < 1:
+                logger.error(f"Mode numbers must be ≥ 1 (got '{token}').")
+                sys.exit(1)
+            modes.add(m)
+
+    if not modes:
+        logger.error("Empty mode selection — provide at least one mode number.")
+        sys.exit(1)
+
+    return sorted(modes)
+
+def find_enm_output_files(output_folder):
+    """
+    Locate the three required ENM output files inside *output_folder*.
+
+    Searches for:
+      * ``*_modes.npy``              – eigenvector matrix
+      * ``*_frequencies.npy``        – frequency array
+      * ``*_ca_structure.pdb``  **or**  ``*_heavy_structure.pdb`` – structure
+
+    Returns
+    -------
+    modes_file : str
+        Eigenvector matrix file name
+    freq_file : str
+        Frequency array file name
+    structure_pdb : str
+        Structure file name
+
+    Raises
+    ------
+    SystemExit
+        When any required file is missing or when the directory contains
+        ambiguous matches (multiple runs mixed in the same folder).
+    """
+    import glob
+
+    def _require_one(pattern, label):
+        matches = glob.glob(pattern)
+        if not matches:
+            logger.error(
+                f"No {label} found matching '{pattern}'.\n"
+                f"       Make sure -o points to a completed ENM output directory."
+            )
+            sys.exit(1)
+        if len(matches) > 1:
+            logger.error(
+                f"Multiple {label} files found (ambiguous):\n"
+                + "\n".join(f"         {m}" for m in matches)
+                + "\n       Use a more specific -o path."
+            )
+            sys.exit(1)
+        return matches[0]
+
+    base = output_folder.rstrip(os.sep)
+
+    modes_file = _require_one(os.path.join(base, '*_modes.npy'),
+                              'eigenvector file (*_modes.npy)')
+    freq_file  = _require_one(os.path.join(base, '*_frequencies.npy'),
+                              'frequency file (*_frequencies.npy)')
+
+    import glob as _glob
+    pdb_candidates = (
+        _glob.glob(os.path.join(base, '*_ca_structure.pdb')) +
+        _glob.glob(os.path.join(base, '*_heavy_structure.pdb'))
+    )
+    if not pdb_candidates:
+        logger.error(
+            f"No structure PDB found in '{output_folder}' "
+            f"(looked for *_ca_structure.pdb and *_heavy_structure.pdb).\n"
+            f"       Make sure the ENM run completed successfully."
+        )
+        sys.exit(1)
+    if len(pdb_candidates) > 1:
+        logger.error(
+            f"Multiple structure PDB files found in '{output_folder}':\n"
+            + "\n".join(f"         {p}" for p in pdb_candidates)
+            + "\n       Use a more specific -o path."
+        )
+        sys.exit(1)
+
+    return modes_file, freq_file, pdb_candidates[0]
+
+def write_modes_from_files(output_folder, mode_numbers, write_trajectories=True, amplitude=4, num_frames=34):
+    """
+    Write mode vectors (.xyz) and/or PDB trajectories for an arbitrary
+    selection of previously computed modes, without rerunning the ENM.
+
+    Parameters
+    ----------
+    output_folder : str
+        Directory containing a completed ENM run.
+    mode_numbers : list[int]
+        Sorted list of 1-based mode numbers to write (as they appear in
+        the output file names, e.g. ``[26, 41]``).
+    write_trajectories : bool
+        ``True``  → write ``.xyz`` vectors **and** ``_traj.pdb`` files.
+        ``False`` → write only ``.xyz`` vectors (equivalent to
+        passing ``--no_nm_trj`` during the original run).
+    amplitude : float
+        Peak displacement amplitude in Å for trajectory frames. Default: 4.
+    num_frames : int
+        Number of MODEL frames per trajectory PDB. Default: 34.
+    """
+    logger.info("Write-modes module — post-hoc mode writer\n")
+
+    # Locate files
+    logger.info(f"Searching for ENM output files in '{output_folder}' ...")
+    modes_file, freq_file, pdb_file = find_enm_output_files(output_folder)
+    logger.info(f"  Modes        : {os.path.basename(modes_file)}")
+    logger.info(f"  Frequencies  : {os.path.basename(freq_file)}")
+    logger.info(f"  Structure    : {os.path.basename(pdb_file)}")
+
+    # Load NumPy arrays
+    modes       = np.load(modes_file)
+    frequencies = np.load(freq_file).ravel()
+
+    if modes.ndim != 2:
+        logger.error(
+            f"Unexpected modes array shape {modes.shape}; expected (3N, M)."
+        )
+        sys.exit(1)
+
+    n_stored = modes.shape[1]
+    n_atoms  = modes.shape[0] // 3
+    logger.info(f"  Stored modes : {n_stored}  |  Atoms : {n_atoms}\n")
+
+    # Validate requested modes
+    rigid_body   = [m for m in mode_numbers if 1 <= m <= 6]
+    out_of_range = [m for m in mode_numbers if m > n_stored]
+
+    if rigid_body:
+        logger.warning(
+            f"Modes {rigid_body} correspond to near-zero rigid-body "
+            f"translations/rotations and are typically not meaningful. "
+            f"Proceeding anyway."
+        )
+    if out_of_range:
+        logger.error(
+            f"Requested mode(s) {out_of_range} exceed the number of stored "
+            f"modes ({n_stored}).\n"
+            f"       Re-run ENM with -n {max(out_of_range)} (or larger) to "
+            f"compute and store additional modes."
+        )
+        sys.exit(1)
+
+    # Rebuild OpenMM topology + positions from the structure PDB
+    structure  = app.PDBFile(pdb_file)
+    topology   = structure.topology
+    positions  = structure.positions   # openmm.unit.Quantity, in nm
+
+    # Reconstruct a lightweight System carrying only particle masses
+    system = mm.System()
+    for atom in topology.atoms():
+        if atom.element is not None:
+            system.addParticle(atom.element.mass)
+        else:
+            system.addParticle(12.011 * unit.daltons)   # fallback: carbon
+
+    # Derive the output prefix from the modes-file path
+    output_prefix = modes_file[:-len('_modes.npy')]
+
+    # Infer model_type from structure file name
+    model_type = 'ca' if '_ca_structure.pdb' in pdb_file else 'heavy'
+
+    # Write each requested mode
+    n_write = len(mode_numbers)
+    action  = 'vector + trajectory' if write_trajectories else 'vector only'
+    logger.info(
+        f"Writing {n_write} mode(s) ({action}):")
+    logger.info(f"Modes successfully written: {mode_numbers}.\n")
+
+    elements = [atom.element.symbol if atom.element else 'C'
+                for atom in topology.atoms()]
+
+    for mode_num in mode_numbers:
+        mode_idx = mode_num - 1   # 0-based column index in the modes array
+
+        # Vector file (.xyz)
+        freq_cm1 = frequencies[mode_idx] * 108.58   # internal → cm⁻¹
+        vec_file = f"{output_prefix}_mode_{mode_num}.xyz"
+
+        with open(vec_file, 'w') as f:
+            f.write(f"{n_atoms}\n")
+            f.write(f"Normal Mode {mode_num}, Frequency: {freq_cm1:.2f} cm⁻¹\n")
+            mode_vector = modes[:, mode_idx].reshape(n_atoms, 3)
+            for i in range(n_atoms):
+                x, y, z = mode_vector[i]
+                f.write(f"{elements[i]:2s} {x:14.10f} {y:14.10f} {z:14.10f}\n")
+
+        # Trajectory file (_traj.pdb)
+        if write_trajectories:
+            n_particles = system.getNumParticles()
+            trj_file    = f"{output_prefix}_mode_{mode_num}_traj.pdb"
+
+            # Undo mass-weighting: u_cart = M^{-1/2} · u_mw
+            masses      = np.array([
+                system.getParticleMass(i).value_in_unit(unit.dalton)
+                for i in range(n_particles)
+            ])
+            masses[masses == 0] = 1.0
+            inv_sqrt_m  = np.repeat(1.0 / np.sqrt(masses), 3)
+            u           = modes[:, mode_idx] * inv_sqrt_m
+
+            rms = np.linalg.norm(u) / np.sqrt(n_particles)
+            if rms < 1e-10:
+                logger.warning(
+                    f"  Mode {mode_num:4d} | near-zero displacement norm — "
+                    f"skipping trajectory."
+                )
+                continue
+
+            # Scale displacement so its RMS equals the requested amplitude (Å → nm)
+            scaled_disp = u.reshape(n_particles, 3) * (amplitude / rms * 0.1)
+
+            orig_pos_np = np.array([
+                [p.x, p.y, p.z]
+                for p in positions.value_in_unit(unit.nanometer)
+            ])
+
+            # Piecewise-linear oscillation: 0 → −A → 0 → +A → 0
+            seg1 = int(num_frames * 0.25)
+            seg2 = int(num_frames * 0.25)
+            seg3 = int(num_frames * 0.25)
+            seg4 = num_frames - seg1 - seg2 - seg3
+
+            with open(trj_file, 'w') as f:
+                for frame in range(num_frames):
+                    if frame < seg1:
+                        factor = -frame / seg1
+                    elif frame < seg1 + seg2:
+                        factor = -1 + (frame - seg1) / seg2
+                    elif frame < seg1 + seg2 + seg3:
+                        factor = (frame - seg1 - seg2) / seg3
+                    else:
+                        factor = 1 - (frame - seg1 - seg2 - seg3) / seg4
+
+                    new_pos_np = orig_pos_np + scaled_disp * factor
+                    new_positions = [
+                        mm.Vec3(new_pos_np[i, 0],
+                                new_pos_np[i, 1],
+                                new_pos_np[i, 2])
+                        for i in range(n_particles)
+                    ]
+                    pos_qty = unit.Quantity(new_positions, unit.nanometer)
+
+                    f.write(f"MODEL     {frame + 1:5d}\n")
+                    app.PDBFile.writeFile(topology, pos_qty, f, keepIds=True)
+                    f.write("ENDMDL\n")
+
+            convert_hetatm_to_atom(trj_file)
+
+    logger.info(f"Done. Files written to '{os.path.abspath(output_folder)}'")
+
+
 def main():
-    """Run ENM normal mode analysis from the command line."""
+    """
+    Main function to perform Normal Mode Analysis.
+
+    Configuration is set via the CONFIG dictionary, which includes:
+    - PDB_FILE: Input PDB file
+    - MODEL_TYPE: 'ca' for Cα-only or 'heavy' for heavy-atom ENM
+    - CUTOFF: Cutoff distance for interactions
+    - SPRING_CONSTANT: Spring constant for ENM bonds
+    - MAX_MODES: Number of non-rigid modes to compute
+    - OUTPUT_FOLDER: Folder name where to write the output files
+    - OUTPUT_MODES: Number of modes to save
+    - WRITE_NM_VEC: Whether to write mode vectors to text files
+    - WRITE_NM_TRJ: Whether to write mode trajectory files
+    - COLLECTIVITY: Whether to compute modes collectivity
+    - PLOT_CONTRIBUTIONS: Whether to plot modes cumulative contribution to internal dynamics
+    - PLOT_RMSF: Whether to plot modes RMSF
+    - PLOT_DCCM: Whether to build and plot residue dynamical cross correlation matrix
+    - USE_GPU: Whether to use GPU acceleration
+    """
+    # Parse command-line arguments
     args = parse_arguments()
 
+    # -w / --write_modes: post-hoc writer, no recomputation needed
+    if args.write_modes is not None:
+        mode_numbers = parse_mode_string(args.write_modes)
+        write_modes_from_files(
+            output_folder      = args.output,
+            mode_numbers       = mode_numbers,
+            write_trajectories = args.no_nm_trj,   # False when --no_nm_trj is set
+            amplitude          = 4,
+            num_frames         = 34,
+        )
+        return
+
+    # Map arguments to CONFIG dictionary
     CONFIG = {
         "PDB_FILE": args.input,
         "MODEL_TYPE": args.type,
@@ -1262,9 +1632,11 @@ def main():
         "USE_GPU": args.no_gpu
     }
 
+    # Create output folder
     output_folder = CONFIG["OUTPUT_FOLDER"]
     os.makedirs(output_folder, exist_ok=True)
 
+    # Get input filename without extension
     input_file = CONFIG["PDB_FILE"]
     base_name = os.path.splitext(os.path.basename(input_file))[0]
     output_prefix = os.path.join(output_folder, base_name)
@@ -1278,8 +1650,10 @@ def main():
     logger.info(f"Number of modes to output: {CONFIG['OUTPUT_MODES']}\n")
 
     try:
+        # Prefix to output files
         prefix = "ca" if CONFIG["MODEL_TYPE"] == 'ca' else "heavy"
 
+        # Create system
         system, topology, positions = create_system(
             CONFIG["PDB_FILE"],
             model_type=CONFIG["MODEL_TYPE"],
@@ -1288,9 +1662,19 @@ def main():
             spring_constant=CONFIG["SPRING_CONSTANT"],
         )
 
-        hessian = hessian_enm(system, positions)
-        mw_hessian = mass_weight_hessian(hessian, system)
+        # Compute Hessian
+        hessian = hessian_enm(
+            system,
+            positions
+        )
 
+        # Mass-weight Hessian
+        mw_hessian = mass_weight_hessian(
+            hessian,
+            system
+        )
+
+        # Compute Normal Modes
         frequencies, modes, eigenvalues = compute_normal_modes(
             mw_hessian,
             n_modes=CONFIG["MAX_MODES"],
@@ -1301,42 +1685,47 @@ def main():
         np.save(f"{output_prefix}_{prefix}_modes.npy", modes)
         logger.info(f"Results saved to {output_prefix}_{prefix}_*.npy files")
 
+        # Write collectivity data
         if CONFIG["COLLECTIVITY"]:
             collectivity_file = f"{output_prefix}_{prefix}_collectivity.csv"
             write_collectivity(
                 frequencies, modes, system,
                 collectivity_file,
-                n_modes=20
+                n_modes=20  # Use first 20 non-rigid modes
             )
 
+        # Plot internal dynamics contributions
         if CONFIG["PLOT_CONTRIBUTIONS"]:
             output_file = f"{output_prefix}_{prefix}_contributions.png"
             plot_mode_contributions(
                 eigenvalues,
                 output_file,
-                n_modes=20
+                n_modes=20  # Use first 20 non-rigid modes
             )
 
+        # Plot RMSF
         if CONFIG["PLOT_RMSF"]:
             output_file=f"{output_prefix}_{prefix}_rmsf.png"
             rmsf = plot_atomic_fluctuations(
                 system, eigenvalues, modes, topology,
                 output_file,
-                temperature=300,
-                n_modes=50,
+                temperature=300,  # Room temperature
+                n_modes=50,       # Use first 50 non-rigid modes
             )
 
+        # Plot Residue Cross Correlation
         if CONFIG["PLOT_DCCM"]:
             output_file=f"{output_prefix}_{prefix}_dccm.png"
             dccm = plot_residue_cross_correlation(
                 system, eigenvalues, modes, topology,
                 output_file,
-                temperature=300,
-                n_modes=50,
-                use_gpu=CONFIG["USE_GPU"],
-                use_multithreading=True
+                temperature=300,            # Room temperature
+                n_modes=50,                 # Use first 50 non-rigid modes
+                use_gpu=CONFIG["USE_GPU"],  # Enable GPU usage
+                use_multithreading=True     # Enable multithreading for CPU
             )
 
+        # Write mode vectors
         if CONFIG["WRITE_NM_VEC"]:
             num_modes = min(CONFIG["OUTPUT_MODES"], len(frequencies)-6)
             logger.info(f"Writing vectors for {num_modes} modes...\n")
@@ -1344,9 +1733,10 @@ def main():
                 modes, frequencies, system, topology,
                 f"{output_prefix}_{prefix}",
                 n_modes=CONFIG["OUTPUT_MODES"],
-                start_mode=6
+                start_mode=6  # Start from mode 7 (index 6)
             )
 
+        # Write mode trajectories
         if CONFIG["WRITE_NM_TRJ"]:
             num_modes = min(CONFIG["OUTPUT_MODES"], len(frequencies)-6)
             logger.info(f"Generating trajectories for {num_modes} modes...\n")
@@ -1354,7 +1744,7 @@ def main():
                 topology, positions, modes, frequencies,
                 f"{output_prefix}_{prefix}", system, CONFIG["MODEL_TYPE"],
                 n_modes=CONFIG["OUTPUT_MODES"],
-                start_mode=6
+                start_mode=6  # Start from mode 7 (index 6)
             )
 
     except Exception as e:
